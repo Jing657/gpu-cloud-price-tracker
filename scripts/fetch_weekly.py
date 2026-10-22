@@ -94,3 +94,6 @@ def aws_quotes():
             try:
                 price = float(field(r, 'PricePerUnit', 'Price Per Unit'))
             except ValueError:
+                      continue
+            if price <= 0:
+                continue
