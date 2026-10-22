@@ -1,4 +1,68 @@
-except (ValueError, TypeError):
+"""Weekly US AWS/Azure on-demand GPU price snapshots.
+
+Preserves existing monthly CSV and 14-column weekly CSV contract.
+Uses public AWS offer JSON and Azure Retail Prices API; no credentials required.
+"""
+import csv
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import urllib.parse
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / 'data'
+DATA.mkdir(exist_ok=True)
+OUT = DATA / 'weekly_prices.csv'
+STATUS = DATA / 'weekly_update_status.csv'
+FIELDS = ['observed_at_utc','week_start','provider','gpu','region','instance_type','gpu_count','vm_usd_per_hour','usd_per_gpu_hour','pricing_type','source_url','source_sku','source_effective_date','status']
+AWS_TYPES = {'p5.48xlarge': ('H100', 8), 'p5e.48xlarge': ('H200', 8)}
+AZURE_TYPES = {'Standard_ND96isr_H100_v5': ('H100', 8), 'Standard_ND96isr_H200_v5': ('H200', 8)}
+AWS_URL = 'https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.json'
+AZURE_BASE = 'https://prices.azure.com/api/retail/prices'
+
+
+def get_json(url, timeout=240):
+    request = urllib.request.Request(url, headers={'User-Agent':'GPU-Price-Research/1.1', 'Accept':'application/json'})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def aws_quotes():
+    """Read public AWS regional offer, matching products to OnDemand terms by SKU."""
+    data = get_json(AWS_URL, timeout=300)
+    products = data.get('products', {})
+    terms = data.get('terms', {}).get('OnDemand', {})
+    candidates = {}
+    for sku, product in products.items():
+        attrs = product.get('attributes', {})
+        instance = attrs.get('instanceType', '')
+        if instance not in AWS_TYPES:
+            continue
+        if attrs.get('operatingSystem') != 'Linux' or attrs.get('tenancy') != 'Shared':
+            continue
+        if attrs.get('preInstalledSw', 'NA') not in ('NA', ''):
+            continue
+        if attrs.get('capacitystatus', 'Used') not in ('Used', ''):
+            continue
+        if product.get('productFamily') != 'Compute Instance':
+            continue
+        usage = attrs.get('usagetype', attrs.get('usageType', ''))
+        if 'BoxUsage' not in usage:
+            continue
+        candidates[sku] = instance
+    print(f'AWS matched product SKUs: {len(candidates)}; instance types: {sorted(set(candidates.values()))}', flush=True)
+    quotes = []
+    for sku, instance in candidates.items():
+        for offer in terms.get(sku, {}).values():
+            effective = offer.get('effectiveDate', '')
+            for dimension in offer.get('priceDimensions', {}).values():
+                if dimension.get('unit') not in ('Hrs', 'Hours'):
+                    continue
+                try:
+                    price = float(dimension.get('pricePerUnit', {}).get('USD', ''))
+                except (ValueError, TypeError):
                     continue
                 if price <= 0:
                     continue
