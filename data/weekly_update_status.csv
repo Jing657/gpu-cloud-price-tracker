@@ -1,0 +1,3 @@
+provider,status,quote_count,error,checked_at_utc
+aws,error,0,AWS CSV header not found,2026-10-22T06:40:06+00:00
+azure,ok,1,,2026-10-22T06:40:06+00:00

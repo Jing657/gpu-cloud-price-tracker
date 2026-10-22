@@ -1,0 +1,2 @@
+observed_at_utc,week_start,provider,gpu,region,instance_type,gpu_count,vm_usd_per_hour,usd_per_gpu_hour,pricing_type,source_url,source_sku,source_effective_date,status
+2026-10-22T06:40:06+00:00,2026-10-19,azure,H100,eastus,Standard_ND96isr_H100_v5,8,98.32,12.29,on_demand,https://prices.azure.com/api/retail/prices?%24filter=serviceName+eq+%27Virtual+Machines%27+and+armRegionName+eq+%27eastus%27+and+armSkuName+eq+%27Standard_ND96isr_H100_v5%27+and+priceType+eq+%27Consumption%27&currencyCode=USD,03f48dbf-423c-5af8-9e6f-36e42dda07ec,2023-12-01T00:00:00Z,ok
