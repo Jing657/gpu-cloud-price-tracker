@@ -1,118 +1,100 @@
-                continue
-            if price <= 0:
-                continue
-            counts['positive_hourly'] += 1
-            gpu, gpu_count = AWS_TYPES[typ]
-            quotes.append(dict(provider='aws', gpu=gpu, region='us-east-1',
-                               instance_type=typ, gpu_count=gpu_count,
-                               vm_usd_per_hour=price,
-                               usd_per_gpu_hour=price / gpu_count,
-                               pricing_type='on_demand', source_url=AWS_URL,
-                               source_sku=field(r, 'SKU'),
-                               source_effective_date=field(r, 'EffectiveDate', 'Effective Date'),
-                               status='ok'))
-    unique = {}
-    for q in quotes:
-        key = (q['region'], q['instance_type'])
-        if key in unique and abs(unique[key]['vm_usd_per_hour'] - q['vm_usd_per_hour']) > 1e-8:
-            raise RuntimeError(f'AWS conflicting prices for {key}')
-        unique[key] = q
-    print('AWS candidate instance types:', sorted(candidates), flush=True)
-    print('AWS filter counts:', counts, 'valid quotes:', len(unique), flush=True)
-    return list(unique.values())
 
 
-def azure_quotes():
+"""Collect independent weekly US AWS/Azure GPU on-demand price observations.
+
+Standard library only. Unknown SKUs are never inferred. Existing monthly data is untouched.
+"""
+import csv
+import datetime as dt
+import io
+import json
+import os
+from pathlib import Path
+import urllib.parse
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / 'data'
+DATA.mkdir(exist_ok=True)
+OUT = DATA / 'weekly_prices.csv'
+STATUS = DATA / 'weekly_update_status.csv'
+FIELDS = ['observed_at_utc','week_start','provider','gpu','region','instance_type',
+          'gpu_count','vm_usd_per_hour','usd_per_gpu_hour','pricing_type','source_url',
+          'source_sku','source_effective_date','status']
+AWS_TYPES = {'p5.48xlarge': ('H100', 8), 'p5e.48xlarge': ('H200', 8)}
+AZURE_TYPES = {'Standard_ND96isr_H100_v5': ('H100', 8),
+               'Standard_ND96isr_H200_v5': ('H200', 8)}
+AWS_URL = 'https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/us-east-1/index.csv'
+AZURE_BASE = 'https://prices.azure.com/api/retail/prices'
+
+
+def fetch(url, timeout=180):
+    request = urllib.request.Request(url, headers={
+        'User-Agent': 'GPU-Price-Research/1.0',
+        'Accept': 'application/json,text/csv'})
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def field(row, *names):
+    """Case-insensitive column lookup, accounting for spaces and punctuation."""
+    normalized = {''.join(c for c in str(k).lower() if c.isalnum()): v
+                  for k, v in row.items() if k is not None}
+    for name in names:
+        key = ''.join(c for c in name.lower() if c.isalnum())
+        if key in normalized and normalized[key] is not None:
+            return str(normalized[key]).strip()
+    return ''
+
+
+def aws_quotes():
     quotes = []
-    for sku, (gpu, count) in AZURE_TYPES.items():
-        filter_expr = ("serviceName eq 'Virtual Machines' and armRegionName eq 'eastus' "
-                       "and armSkuName eq '%s' and priceType eq 'Consumption'" % sku)
-        url = AZURE_BASE + '?' + urllib.parse.urlencode({'$filter': filter_expr, 'currencyCode': 'USD'})
-        next_url, seen = url, set()
-        while next_url:
-            if next_url in seen:
-                raise RuntimeError('Azure pagination loop')
-            seen.add(next_url)
-            with fetch(next_url) as response:
-                payload = json.load(response)
-            for item in payload.get('Items', []):
-                if item.get('armSkuName') != sku or item.get('armRegionName') != 'eastus':
-                    continue
-                if item.get('type') != 'Consumption' or item.get('currencyCode') != 'USD':
-                    continue
-                if item.get('unitOfMeasure') != '1 Hour':
-                    continue
-                if item.get('isPrimaryMeterRegion') is False:
-                    continue
-                desc = ' '.join(str(item.get(k, '')) for k in ('productName', 'skuName', 'meterName'))
-                if any(x in desc.lower() for x in ('spot', 'low priority', 'windows', 'promo')):
-                    continue
-                try:
-                    price = float(item['retailPrice'])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if price <= 0:
-                    continue
-                quotes.append(dict(provider='azure', gpu=gpu, region='eastus',
-                                   instance_type=sku, gpu_count=count,
-                                   vm_usd_per_hour=price, usd_per_gpu_hour=price / count,
-                                   pricing_type='on_demand', source_url=url,
-                                   source_sku=item.get('meterId', ''),
-                                   source_effective_date=item.get('effectiveStartDate', ''),
-                                   status='ok'))
-            next_url = payload.get('NextPageLink')
-    unique = {}
-    for q in quotes:
-        key = (q['region'], q['instance_type'])
-        if key in unique and abs(unique[key]['vm_usd_per_hour'] - q['vm_usd_per_hour']) > 1e-8:
-            raise RuntimeError(f'Azure conflicting prices for {key}')
-        unique[key] = q
-    print('Azure valid quotes:', len(unique), flush=True)
-    return list(unique.values())
+    counts = {'matching_instance': 0, 'on_demand': 0, 'linux_shared': 0,
+              'compute_family': 0, 'box_usage': 0, 'positive_hourly': 0}
+    candidates = set()
+    with fetch(AWS_URL, timeout=300) as response:
+        stream = io.TextIOWrapper(response, encoding='utf-8-sig', newline='')
+        reader = csv.reader(stream)
+        header = None
+        for record in reader:
+            cleaned = [x.strip().lstrip('\ufeff') for x in record]
+            if 'SKU' in cleaned and ('Instance Type' in cleaned or 'instanceType' in cleaned):
+                header = cleaned
+                break
+        if header is None:
+            raise RuntimeError('AWS CSV header not found (SKU + Instance Type); check source format')
+        print('AWS header columns:', header, flush=True)
+        for values in reader:
+            if len(values) != len(header):
+                continue
+            r = dict(zip(header, values))
+            typ = field(r, 'Instance Type', 'instanceType')
+            if typ not in AWS_TYPES:
+                continue
+            counts['matching_instance'] += 1
+            candidates.add(typ)
+            if field(r, 'TermType', 'Term Type').lower() != 'ondemand':
+                continue
+            counts['on_demand'] += 1
+            if field(r, 'Operating System', 'operatingSystem').lower() != 'linux':
+                continue
+            if field(r, 'Tenancy').lower() != 'shared':
+                continue
+            if field(r, 'Pre Installed S/W', 'preInstalledSw').lower() not in ('na', ''):
+                continue
+            if field(r, 'Capacity Status', 'capacitystatus').lower() not in ('used', ''):
+                continue
+            counts['linux_shared'] += 1
+            if field(r, 'Product Family', 'productFamily').lower() != 'compute instance':
+                continue
+            counts['compute_family'] += 1
+            usage = field(r, 'UsageType', 'Usage Type', 'usageType')
+            if 'BoxUsage' not in usage:
+                continue
+            counts['box_usage'] += 1
+            if field(r, 'Unit').lower() not in ('hrs', 'hours'):
+                continue
+            try:
+                price = float(field(r, 'PricePerUnit', 'Price Per Unit'))
+            except ValueError:
 
 
-def main():
-    now = dt.datetime.now(dt.timezone.utc)
-    stamp = now.isoformat(timespec='seconds')
-    week = (now.date() - dt.timedelta(days=now.weekday())).isoformat()
-    previous = []
-    if OUT.exists():
-        with OUT.open(newline='', encoding='utf-8-sig') as f:
-            previous = list(csv.DictReader(f))
-    observations, statuses = [], []
-    for name, collector in [('aws', aws_quotes), ('azure', azure_quotes)]:
-        try:
-            found = collector()
-            statuses.append((name, 'ok' if found else 'no_matching_sku', len(found), '', stamp))
-            for q in found:
-                q.update(observed_at_utc=stamp, week_start=week)
-            observations.extend(found)
-        except Exception as exc:
-            statuses.append((name, 'error', 0, str(exc)[:300], stamp))
-    new_keys = {(r['week_start'], r['provider'], r['region'], r['instance_type'])
-                for r in observations}
-    previous = [r for r in previous if
-                (r['week_start'], r['provider'], r['region'], r['instance_type']) not in new_keys]
-    combined = previous + observations
-    combined.sort(key=lambda r: (r['week_start'], r['provider'], r['gpu'],
-                                 r['region'], r['instance_type']))
-    temp = OUT.with_suffix('.tmp')
-    with temp.open('w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(combined)
-    os.replace(temp, OUT)
-    with STATUS.open('w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['provider', 'status', 'quote_count', 'error', 'checked_at_utc'])
-        writer.writerows(statuses)
-    for row in statuses:
-        print(*row, sep=' | ', flush=True)
-    if any(s[1] == 'error' for s in statuses):
-        raise SystemExit('One or more API sources failed; check status CSV')
-    if not observations:
-        raise SystemExit('No verified prices found; review SKU mappings and API response')
-
-
-if __name__ == '__main__':
-    main()
