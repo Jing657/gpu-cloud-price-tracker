@@ -1,5 +1,5 @@
 provider,status,quote_count,error,checked_at_utc
-aws,ok,4,,2026-10-22T07:53:09+00:00
-azure,ok,1,,2026-10-22T07:53:09+00:00
-google_cloud,error,0,GOOGLE_CLOUD_BILLING_API_KEY not configured; GCP official SKU prices require a Google Cloud API key,2026-10-22T07:53:09+00:00
-oracle,no_verified_usd_quote,0,,2026-10-22T07:53:09+00:00
+aws,ok,4,,2026-10-22T07:58:30+00:00
+azure,ok,1,,2026-10-22T07:58:30+00:00
+google_cloud,ok,12,,2026-10-22T07:58:30+00:00
+oracle,no_verified_usd_quote,0,,2026-10-22T07:58:30+00:00
