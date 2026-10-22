@@ -1,4 +1,4 @@
-                except (ValueError, TypeError):
+except (ValueError, TypeError):
                     continue
                 if price <= 0:
                     continue
