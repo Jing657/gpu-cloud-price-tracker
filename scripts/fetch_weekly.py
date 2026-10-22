@@ -112,55 +112,71 @@ def azure_quotes():
     return dedup(rows,'Azure')
 
 
+def classify_gcp_sku(description):
+    """Return comparable GPU-only on-demand vs special purchasing programs."""
+    low = description.lower()
+    if any(x in low for x in ('spot', 'preemptible', 'commitment', 'committed use')):
+        return None
+    if 'dws' in low or 'defined duration' in low:
+        return 'dws_gpu_only'
+    if 'reserved' in low or 'calendar mode' in low or 'reservation' in low:
+        return 'reserved_gpu_only'
+    return 'on_demand_gpu_only'
+
+
 def gcp_quotes():
-    """Official Cloud Billing Catalog; requires GOOGLE_CLOUD_BILLING_API_KEY secret.
-    Only standalone GPU hourly SKUs, excluding commitments/preemptible/spot.
+    """Collect GCP GPU-only SKU prices, preserving the purchasing program.
+
+    Catalog category usageType alone is insufficient: DWS/Reserved GPU SKUs
+    can also report OnDemand. Their descriptions must be classified separately.
     """
-    key = os.environ.get('GOOGLE_CLOUD_BILLING_API_KEY','').strip()
+    key = os.environ.get('GOOGLE_CLOUD_BILLING_API_KEY', '').strip()
     if not key:
         raise RuntimeError('GOOGLE_CLOUD_BILLING_API_KEY not configured; GCP official SKU prices require a Google Cloud API key')
-    url = GCP_BASE+'?'+urllib.parse.urlencode({'key':key,'currencyCode':'USD','pageSize':5000})
-    rows,token = [],''
+    base = GCP_BASE + '?' + urllib.parse.urlencode({'key': key, 'currencyCode': 'USD', 'pageSize': 5000})
+    rows, token = [], ''
     while True:
-        next_url = url + ('&pageToken='+urllib.parse.quote(token) if token else '')
+        next_url = base + ('&pageToken=' + urllib.parse.quote(token) if token else '')
         payload = get_json(next_url)
-        for sku in payload.get('skus',[]):
-            cat = sku.get('category',{})
+        for sku in payload.get('skus', []):
+            cat = sku.get('category', {})
             if cat.get('resourceFamily') != 'Compute' or cat.get('usageType') != 'OnDemand':
                 continue
-            desc = sku.get('description','')
+            desc = sku.get('description', '')
             low = desc.lower()
             if not ('gpu' in low or 'nvidia' in low):
                 continue
-            if any(x in low for x in ('spot','preemptible','commitment','reservation','ram','cpu','interconnect')):
+            if any(x in low for x in ('ram', 'cpu', 'interconnect')):
                 continue
-            gpu = next((g for g in ('H100','H200','B200','B300') if re.search(r'(?<![A-Z0-9])'+g+r'(?![A-Z0-9])',desc,re.I)),None)
-            if not gpu:
+            pricing_type = classify_gcp_sku(desc)
+            if pricing_type is None:
                 continue
-            regions = sku.get('serviceRegions',[])
-            if 'us-central1' not in regions:
+            gpu = next((g for g in ('H100', 'H200', 'B200', 'B300')
+                        if re.search(r'(?<![A-Z0-9])' + g + r'(?![A-Z0-9])', desc, re.I)), None)
+            if not gpu or 'us-central1' not in sku.get('serviceRegions', []):
                 continue
-            pi = sku.get('pricingInfo',[])
-            if not pi:
+            infos = sku.get('pricingInfo', [])
+            if not infos:
                 continue
-            expr = pi[-1].get('pricingExpression',{})
-            if expr.get('usageUnit') not in ('h','hour'):
+            info = infos[-1]
+            expr = info.get('pricingExpression', {})
+            if expr.get('usageUnit') not in ('h', 'hour'):
                 continue
-            tiers = expr.get('tieredRates',[])
-            if len(tiers) != 1 or float(tiers[0].get('startUsageAmount',-1)) != 0:
+            tiers = expr.get('tieredRates', [])
+            if len(tiers) != 1 or float(tiers[0].get('startUsageAmount', -1)) != 0:
                 continue
-            money = tiers[0].get('unitPrice',{})
+            money = tiers[0].get('unitPrice', {})
             if money.get('currencyCode') != 'USD':
                 continue
-            p = float(money.get('units',0))+int(money.get('nanos',0))/1e9
-            if p > 0:
-                rows.append(quote('google_cloud',gpu,'us-central1',desc,1,p,
-                    'https://cloud.google.com/compute/gpus-pricing',sku.get('skuId',''),pi[-1].get('effectiveTime',''),
-                    pricing_type='on_demand_gpu_only'))
-        token = payload.get('nextPageToken','')
+            price = float(money.get('units', 0)) + int(money.get('nanos', 0)) / 1e9
+            if price > 0:
+                rows.append(quote('google_cloud', gpu, 'us-central1', desc, 1, price,
+                    'https://cloud.google.com/compute/gpus-pricing', sku.get('skuId', ''),
+                    info.get('effectiveTime', ''), pricing_type=pricing_type))
+        token = payload.get('nextPageToken', '')
         if not token:
             break
-    return dedup(rows,'Google Cloud')
+    return dedup(rows, 'Google Cloud')
 
 
 def oracle_quotes():
@@ -187,6 +203,13 @@ def main():
             if reader.fieldnames != FIELDS:
                 raise ValueError('Existing weekly CSV schema mismatch; refusing overwrite')
             prior = list(reader)
+    # Correct previously mislabelled GCP observations, including DWS and
+    # Reserved rows from earlier runs. Do not change historical prices/dates.
+    for old in prior:
+        if old.get('provider') == 'google_cloud' and old.get('pricing_type') == 'on_demand_gpu_only':
+            classified = classify_gcp_sku(old.get('instance_type', ''))
+            if classified:
+                old['pricing_type'] = classified
     rows,statuses = [],[]
     for name,func in [('aws',aws_quotes),('azure',azure_quotes),('google_cloud',gcp_quotes),('oracle',oracle_quotes)]:
         try:
@@ -199,6 +222,10 @@ def main():
     for row in rows:
         row.update(observed_at_utc=stamp,week_start=week)
     keys = {(r['week_start'],r['provider'],r['region'],r['instance_type'],r['pricing_type']) for r in rows}
+    # A successful provider refresh replaces that provider's current-week
+    # observations; on error, keep the last good snapshot instead.
+    refreshed = {name for name, status, count, err, checked in statuses if status == 'ok'}
+    prior = [r for r in prior if not (r['week_start'] == week and r['provider'] in refreshed)]
     prior = [r for r in prior if (r['week_start'],r['provider'],r['region'],r['instance_type'],r['pricing_type']) not in keys]
     merged = sorted(prior+rows,key=lambda r:(r['week_start'],r['provider'],r['gpu'],r['region'],r['instance_type']))
     tmp = OUT.with_suffix('.tmp')
