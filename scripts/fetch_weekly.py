@@ -82,34 +82,45 @@ def aws_quotes():
 
 
 def azure_quotes():
+    """Official Azure Retail API; search multiple regions for documented GPU shapes."""
     rows = []
-    for inst,(gpu,n) in AZURE_TYPES.items():
-        filt = "serviceName eq 'Virtual Machines' and armRegionName eq 'eastus' and armSkuName eq '%s' and priceType eq 'Consumption'" % inst
-        url = AZURE_BASE+'?'+urllib.parse.urlencode({'$filter':filt,'currencyCode':'USD'})
-        nxt,seen = url,set()
-        while nxt:
-            if nxt in seen:
-                raise ValueError('Azure pagination loop')
-            seen.add(nxt)
-            payload = get_json(nxt)
-            for item in payload.get('Items',[]):
-                if item.get('armSkuName') != inst or item.get('armRegionName') != 'eastus':
-                    continue
-                if item.get('type') != 'Consumption' or item.get('currencyCode') != 'USD' or item.get('unitOfMeasure') != '1 Hour':
-                    continue
-                if item.get('isPrimaryMeterRegion') is False:
-                    continue
-                desc = ' '.join(str(item.get(k,'')) for k in ('productName','skuName','meterName')).lower()
-                if any(t in desc for t in ('spot','low priority','windows','promo')):
-                    continue
-                try:
-                    p = float(item['retailPrice'])
-                except (KeyError,ValueError,TypeError):
-                    continue
-                if p > 0:
-                    rows.append(quote('azure',gpu,'eastus',inst,n,p,url,item.get('meterId',''),item.get('effectiveStartDate','')))
-            nxt = payload.get('NextPageLink')
-    return dedup(rows,'Azure')
+    # GPU counts must be verified against Microsoft VM-size documentation.
+    sizes = {
+        'Standard_ND96isr_H100_v5': ('H100', 8),
+        'Standard_ND96isr_H200_v5': ('H200', 8),
+    }
+    regions = ('eastus', 'eastus2', 'southcentralus', 'westus2', 'westus3',
+               'centralus', 'northcentralus', 'swedencentral', 'westeurope')
+    for inst, (gpu, n) in sizes.items():
+        for region in regions:
+            filt = ("serviceName eq 'Virtual Machines' and armRegionName eq '%s' "
+                    "and armSkuName eq '%s' and priceType eq 'Consumption'") % (region, inst)
+            url = AZURE_BASE + '?' + urllib.parse.urlencode({'$filter': filt, 'currencyCode': 'USD'})
+            nxt, seen = url, set()
+            while nxt:
+                if nxt in seen:
+                    raise ValueError('Azure pagination loop')
+                seen.add(nxt)
+                payload = get_json(nxt)
+                for item in payload.get('Items', []):
+                    if item.get('armSkuName') != inst or item.get('armRegionName') != region:
+                        continue
+                    if item.get('type') != 'Consumption' or item.get('currencyCode') != 'USD':
+                        continue
+                    if item.get('unitOfMeasure') != '1 Hour' or item.get('isPrimaryMeterRegion') is False:
+                        continue
+                    desc = ' '.join(str(item.get(k,'')) for k in ('productName','skuName','meterName')).lower()
+                    if any(x in desc for x in ('spot','low priority','windows','promo')):
+                        continue
+                    try:
+                        price = float(item['retailPrice'])
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    if price > 0:
+                        rows.append(quote('azure', gpu, region, inst, n, price,
+                                          url, item.get('meterId',''), item.get('effectiveStartDate','')))
+                nxt = payload.get('NextPageLink')
+    return dedup(rows, 'Azure')
 
 
 def classify_gcp_sku(description):
@@ -180,16 +191,60 @@ def gcp_quotes():
 
 
 def oracle_quotes():
-    """No price inferred from localized currency or blank cells.
-    Official Oracle USD page currently exposes shapes but may omit numeric rates.
+    """Parse Oracle's official USD global price-list PDF, matching exact part numbers.
+
+    This is NOT a hardcoded price feed: prices are read afresh from the PDF.
+    Unknown or changed PDF layouts fail closed instead of recording wrong rates.
     """
-    html = request_bytes(ORACLE_URL).decode('utf-8','replace')
-    text = unescape(re.sub(r'<[^>]+>',' ',html))
-    if 'BM.GPU.H100.8' not in text:
-        raise RuntimeError('Oracle official pricing page structure changed')
-    # Deliberately do not parse unstructured numbers: Oracle's regional pages
-    # can show non-USD amounts and its US page may omit numeric rates.
-    return []
+    import io
+    import pdfplumber
+
+    url = ('https://www.oracle.com/tw/a/ocom/docs/corporate/pricing/'
+           'oracle-paas-and-iaas-global-price-list.pdf')
+    blob = request_bytes(url, timeout=90)
+    if not blob.startswith(b'%PDF'):
+        raise ValueError('Oracle source is not a PDF')
+    # These IDs are official compute GPU part numbers (NOT AI Enterprise licences).
+    products = {
+        'H100': ('B98415', 'BM.GPU.H100.8', 8),
+        'H200': ('B110519', 'BM.GPU.H200.8', 8),
+        'B200': ('B110978', 'BM.GPU.B200.8', 8),
+        'B300': ('B112237', 'BM.GPU.B300.8', 8),
+    }
+    rows = []
+    with pdfplumber.open(io.BytesIO(blob)) as pdf:
+        intro = (pdf.pages[0].extract_text() or '')
+        if 'Global Price List' not in intro:
+            raise ValueError('Unexpected Oracle PDF title')
+        effective = ''
+        match_date = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+20\d{2}', intro)
+        if match_date:
+            effective = match_date.group(0)
+        if not any('Prices in US Dollar' in (page.extract_text() or '') for page in pdf.pages[:3]):
+            raise ValueError('Oracle PDF does not explicitly state USD')
+        for gpu, (part, shape, count) in products.items():
+            candidates = []
+            for page in pdf.pages:
+                txt = page.extract_text(layout=False) or ''
+                if part not in txt:
+                    continue
+                for line in txt.splitlines():
+                    if not re.search(r'\b' + re.escape(part) + r'\b', line):
+                        continue
+                    # PDF columns may reorder, but a matching row must have
+                    # two identical Pay-as-you-go and commitment dollar rates.
+                    numbers = re.findall(r'(?<![\w.])\d+(?:\.\d+)?(?![\w.])', line.replace(part, ''))
+                    if len(numbers) >= 2 and numbers[0] == numbers[1]:
+                        val = float(numbers[0])
+                        if 0 < val < 200:
+                            candidates.append(val)
+            if not candidates or len({round(x, 8) for x in candidates}) != 1:
+                raise ValueError('Cannot uniquely verify Oracle USD rate for %s (%s): %r' % (gpu, part, candidates))
+            price = candidates[0]
+            rows.append(quote('oracle', gpu, 'global_list_price', shape, count,
+                              price * count, url, part, effective,
+                              pricing_type='on_demand'))
+    return rows
 
 
 def main():
