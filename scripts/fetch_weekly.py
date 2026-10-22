@@ -1,5 +1,3 @@
-
-
 """Collect independent weekly US AWS/Azure GPU on-demand price observations.
 
 Standard library only. Unknown SKUs are never inferred. Existing monthly data is untouched.
@@ -96,5 +94,3 @@ def aws_quotes():
             try:
                 price = float(field(r, 'PricePerUnit', 'Price Per Unit'))
             except ValueError:
-
-
