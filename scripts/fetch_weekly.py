@@ -33,10 +33,21 @@ def aws_quotes():
     with fetch(AWS_URL,timeout=300) as response:
         stream=io.TextIOWrapper(response,encoding='utf-8-sig',newline='')
         # AWS bulk CSV includes metadata lines before its header.
-        for line in stream:
-            if line.startswith('SKU,'):
-                header=next(csv.reader([line])); break
-        else: raise RuntimeError('AWS CSV header not found')
+        # Parse the actual CSV header, which commonly begins with quoted "SKU".
+        # Avoid naive line.startswith('SKU,') because AWS quotes header fields.
+        header = None
+        for _ in range(30):
+            line = stream.readline()
+            if not line:
+                break
+            cells = next(csv.reader([line]))
+            cells = [cell.strip().lstrip('\ufeff') for cell in cells]
+            if 'SKU' in cells and 'TermType' in cells and 'PricePerUnit' in cells:
+                header = cells
+                break
+        if header is None:
+            raise RuntimeError('AWS CSV header not found within first 30 lines')
+        print('AWS header detected; columns:', len(header))
         reader=csv.DictReader(stream,fieldnames=header)
         for r in reader:
             typ=r.get('Instance Type','')
