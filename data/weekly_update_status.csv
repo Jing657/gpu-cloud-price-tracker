@@ -1,5 +1,5 @@
 provider,status,quote_count,error,checked_at_utc
-aws,ok,4,,2026-10-22T08:26:52+00:00
-azure,ok,15,,2026-10-22T08:26:52+00:00
-google_cloud,ok,12,,2026-10-22T08:26:52+00:00
-oracle,ok,4,,2026-10-22T08:26:52+00:00
+aws,ok,4,,2026-10-22T08:50:53+00:00
+azure,ok,15,,2026-10-22T08:50:53+00:00
+google_cloud,ok,12,,2026-10-22T08:50:53+00:00
+oracle,ok,4,,2026-10-22T08:50:53+00:00
