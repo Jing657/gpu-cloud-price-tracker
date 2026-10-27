@@ -1,2 +1,2 @@
 checked_at_utc,upstream_last_month,eligible_rows,changed,frequency,source_url
-2026-10-26T07:50:17.846531+00:00,2026-09,2827,True,monthly,https://raw.githubusercontent.com/rahilmittal1/gpu-price-history/main/data/rent/rent_panel_monthly.csv
+2026-10-27T06:32:08.494682+00:00,2026-09,2827,True,monthly,https://raw.githubusercontent.com/rahilmittal1/gpu-price-history/main/data/rent/rent_panel_monthly.csv
